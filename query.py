@@ -55,7 +55,7 @@ COLLECTION_NAME = "academic_rag"
 EMBED_MODEL     = "BAAI/bge-small-en-v1.5"
 EMBED_BATCH     = 32
 
-DEFAULT_LLM_MODEL  = "llama3.1:8b"   # swap to "mistral", "gemma2", etc.
+DEFAULT_LLM_MODEL  = "llama3.2:3b"   # fits in 4GB VRAM; swap to llama3.1:8b if you have 8GB+
 OLLAMA_BASE_URL    = "http://localhost:11434"
 OLLAMA_TIMEOUT_SEC = 120.0
 
@@ -223,17 +223,25 @@ def init_embed_model(model_name: str = EMBED_MODEL) -> HuggingFaceEmbedding:
     """
     Load the same embedding model used during ingestion so that query vectors
     live in the same space as the stored document vectors.
+    Uses CUDA GPU automatically if available for faster encoding.
     """
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Larger batch on GPU for faster throughput
+    batch  = 128 if device == "cuda" else EMBED_BATCH
+
     embed_model = HuggingFaceEmbedding(
         model_name=model_name,
-        embed_batch_size=EMBED_BATCH,
+        embed_batch_size=batch,
         query_instruction=(
             "Represent this sentence for searching relevant passages: "
         ),
+        device=device,
     )
     Settings.embed_model = embed_model
     Settings.llm         = None   # overridden below once Ollama is confirmed
-    print(f"  [EMB] Embedding model: {model_name}")
+    gpu_label = f"GPU ({torch.cuda.get_device_name(0)})" if device == "cuda" else "CPU"
+    print(f"  [EMB] Embedding model: {model_name}  [{gpu_label}]")
     return embed_model
 
 

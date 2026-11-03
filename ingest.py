@@ -1,4 +1,4 @@
-"""
+﻿"""
 ingest.py — Phase 2: Chunking & Vector Database Indexing Engine
 ===============================================================
 Loads parsed Markdown files, chunks them with an academic-aware two-pass
@@ -94,15 +94,15 @@ def _banner(title: str) -> None:
 
 
 def _ok(msg: str) -> None:
-    print(f"  ✓ {msg}")
+    print(f"  OK {msg}")
 
 
 def _info(msg: str) -> None:
-    print(f"  • {msg}")
+    print(f"  - {msg}")
 
 
 def _warn(msg: str) -> None:
-    print(f"  ⚠  {msg}", file=sys.stderr)
+    print(f"  [WARN]  {msg}", file=sys.stderr)
 
 
 def _fatal(msg: str) -> None:
@@ -342,11 +342,24 @@ def init_embedding_model(model_key: str = "bge") -> HuggingFaceEmbedding:
 
     t_start = time.perf_counter()
 
+    # Auto-detect CUDA and use GPU if available
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb  = round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 1)
+        _info(f"Device   : GPU — {gpu_name} ({vram_gb} GB VRAM)")
+        # Larger batch on GPU for faster throughput
+        cfg["embed_batch_size"] = 128
+    else:
+        _info("Device   : CPU (no CUDA GPU detected)")
+
     # Build kwargs; only include trust_remote_code when the preset requires it
     kwargs: dict = {
         "model_name":        model_name,
         "embed_batch_size":  cfg["embed_batch_size"],
         "query_instruction": cfg.get("query_instruction", ""),
+        "device":            device,
     }
     if cfg.get("trust_remote_code"):
         kwargs["trust_remote_code"] = True
@@ -375,9 +388,9 @@ def build_and_persist_index(
     Embed all nodes and persist the index to ChromaDB.
 
     LlamaIndex's VectorStoreIndex handles:
-      • Batching embedding calls according to embed_batch_size
-      • Calling the embedding model for each batch
-      • Writing (id, embedding, metadata, text) tuples to ChromaDB via upsert
+      - Batching embedding calls according to embed_batch_size
+      - Calling the embedding model for each batch
+      - Writing (id, embedding, metadata, text) tuples to ChromaDB via upsert
 
     Because ChromaVectorStore is backed by a PersistentClient, every write is
     flushed to disk immediately — there is no separate "save" or "commit" step.
@@ -447,7 +460,7 @@ def print_final_report(
     print()
     print("  Source files:")
     for fname in sorted(source_files):
-        print(f"    • {fname}")
+        print(f"    - {fname}")
 
     print()
     _ok("Index is ready for Phase 3 (retrieval & querying).")
@@ -560,3 +573,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
