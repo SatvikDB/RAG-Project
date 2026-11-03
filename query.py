@@ -28,7 +28,6 @@ from typing import Optional
 from llama_index.core import QueryBundle, Settings, VectorStoreIndex
 from llama_index.core.postprocessor import SimilarityPostprocessor
 from llama_index.core.query_engine import RetrieverQueryEngine
-from llama_index.core.response.schema import RESPONSE_TYPE
 from llama_index.core.retrievers import BaseRetriever, VectorIndexRetriever
 from llama_index.core.schema import NodeWithScore, QueryBundle, TextNode
 from llama_index.core.prompts import PromptTemplate
@@ -61,7 +60,7 @@ OLLAMA_BASE_URL    = "http://localhost:11434"
 OLLAMA_TIMEOUT_SEC = 120.0
 
 DEFAULT_TOP_K          = 6    # nodes retrieved per retriever
-SIMILARITY_CUTOFF      = 0.20  # discard nodes below this cosine similarity
+SIMILARITY_CUTOFF      = 0.0   # RRF scores are small by nature; no cutoff needed
 HYBRID_VECTOR_WEIGHT   = 0.6  # weight for dense retriever in score fusion
 HYBRID_BM25_WEIGHT     = 0.4  # weight for BM25 retriever in score fusion
 
@@ -490,14 +489,14 @@ def run_academic_query(
     """
     print(f"\n  [QRY] Query: \"{user_query}\"")
 
-    # Step 1: DB
-    index = load_index(chroma_dir=chroma_dir, collection_name=collection_name)
-
-    # Step 2: Embed model
+    # Step 2: Embed model FIRST — must be set before index loads
     init_embed_model()
 
     # Step 3: LLM
     llm = init_llm(model_name=llm_model)
+
+    # Step 1: DB (after embed model is wired into Settings)
+    index = load_index(chroma_dir=chroma_dir, collection_name=collection_name)
 
     # Step 4+5: Engine
     engine = build_query_engine(index=index, llm=llm, top_k=top_k)
