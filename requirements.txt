@@ -24,5 +24,7 @@ rank-bm25>=0.2.2,<0.3.0               # tokenised BM25 used by llama-index-retri
 # ── Markdown parsing utilities (used by LlamaIndex MarkdownNodeParser) ────────
 mistune>=3.0.0,<4.0.0
 
-# ── General utilities ─────────────────────────────────────────────────────────
+# ── PDF parsing ───────────────────────────────────────────────────────────────
+pymupdf>=1.24.0,<3.0.0                # Phase 1: academic PDF extraction
+
 tqdm>=4.66.0
