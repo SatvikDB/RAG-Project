@@ -1,112 +1,164 @@
 """
 ingest.py — Phase 2: Chunking & Vector Database Indexing Engine
 ===============================================================
-Loads parsed Markdown files, chunks them with an academic-aware strategy,
-generates embeddings via a local HuggingFace model, and persists the index
-into a local ChromaDB vector store.
+Loads parsed Markdown files, chunks them with an academic-aware two-pass
+strategy, generates embeddings via a local HuggingFace model, and persists
+the resulting index into a local ChromaDB vector store.
+
+Workflow:
+  1. Load .md files from ./data/parsed_markdown/
+  2. Chunk with MarkdownNodeParser (structure-aware) + SentenceSplitter fallback
+  3. Connect to persistent ChromaDB at ./data/chroma_db/
+  4. Load local HuggingFace embedding model (no API keys needed)
+  5. Embed all nodes and persist to Chroma
+  6. Print a terminal summary report
 
 Usage:
-    python ingest.py
-    python ingest.py --reset        # wipe the collection and re-index from scratch
-    python ingest.py --model nomic  # use nomic-embed-text via Ollama instead
+    python ingest.py                        # Standard run (BGE embeddings)
+    python ingest.py --reset                # Wipe collection and re-index
+    python ingest.py --model nomic          # Use nomic-embed-text-v1 instead
+    python ingest.py --md-dir ./custom/path # Custom markdown directory
 """
 
+from __future__ import annotations
+
 import argparse
+import logging
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
-# ── LlamaIndex core ──────────────────────────────────────────────────────────
+# ── Suppress noisy third-party loggers before any heavy imports ───────────────
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+logging.getLogger("chromadb").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# ── LlamaIndex core ───────────────────────────────────────────────────────────
 from llama_index.core import Settings, SimpleDirectoryReader, StorageContext
 from llama_index.core.indices import VectorStoreIndex
 from llama_index.core.node_parser import MarkdownNodeParser, SentenceSplitter
-from llama_index.core.schema import TextNode
+from llama_index.core.schema import BaseNode, Document, TextNode
 
-# ── Embedding models ─────────────────────────────────────────────────────────
+# ── Embedding model ───────────────────────────────────────────────────────────
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-# ── Vector store ─────────────────────────────────────────────────────────────
+# ── Vector store ──────────────────────────────────────────────────────────────
 import chromadb
+from chromadb.config import Settings as ChromaSettings
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration
+# Project-level defaults  (can be overridden via CLI flags)
 # ─────────────────────────────────────────────────────────────────────────────
 
-PARSED_MD_DIR   = Path("./data/parsed_markdown")
-CHROMA_DB_DIR   = Path("./data/chroma_db")
-COLLECTION_NAME = "academic_rag"
+PARSED_MD_DIR:   Path = Path("./data/parsed_markdown")
+CHROMA_DB_DIR:   Path = Path("./data/chroma_db")
+COLLECTION_NAME: str  = "academic_rag"
 
-# Primary embedding model — runs fully locally, no API key required.
-# Switch to "nomic-embed-text" (Ollama) via --model nomic flag.
-DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+# Chunking parameters
+CHUNK_SIZE:    int = 512   # max tokens per node (≈ 4 chars / token for English)
+CHUNK_OVERLAP: int = 64    # overlap between adjacent nodes to preserve context
 
-# Fallback chunking parameters (used after MarkdownNodeParser as a safety net).
-CHUNK_SIZE    = 512   # tokens
-CHUNK_OVERLAP = 64    # tokens
+# Embedding model presets
+EMBED_PRESETS: dict[str, dict] = {
+    "bge": {
+        "model_name":        "BAAI/bge-small-en-v1.5",
+        "embed_batch_size":  32,
+        "query_instruction": "Represent this sentence for searching relevant passages: ",
+        "description":       "~33 MB · Fast CPU · Strong academic English",
+    },
+    "nomic": {
+        "model_name":        "nomic-ai/nomic-embed-text-v1",
+        "embed_batch_size":  16,
+        "query_instruction": "search_query: ",
+        "trust_remote_code": True,
+        "description":       "~274 MB · Higher quality · More RAM required",
+    },
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Terminal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _banner(msg: str) -> None:
-    """Print a clearly visible section separator to the terminal."""
-    width = 70
-    print("\n" + "=" * width)
-    print(f"  {msg}")
-    print("=" * width)
+WIDTH = 70
 
 
-def _progress(current: int, total: int, label: str = "") -> None:
-    """Print an inline progress indicator."""
-    pct = int(current / total * 100) if total else 0
-    bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-    print(f"\r  [{bar}] {pct:3d}%  {label:<50}", end="", flush=True)
+def _banner(title: str) -> None:
+    """Print a clearly visible section header."""
+    print(f"\n{'=' * WIDTH}")
+    print(f"  {title}")
+    print(f"{'=' * WIDTH}")
+
+
+def _ok(msg: str) -> None:
+    print(f"  ✓ {msg}")
+
+
+def _info(msg: str) -> None:
+    print(f"  • {msg}")
+
+
+def _warn(msg: str) -> None:
+    print(f"  ⚠  {msg}", file=sys.stderr)
+
+
+def _fatal(msg: str) -> None:
+    print(f"\n  [FATAL] {msg}", file=sys.stderr)
+    sys.exit(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 1 — Load Parsed Documents
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_documents(md_dir: Path) -> list:
+def load_documents(md_dir: Path) -> list[Document]:
     """
     Load every .md file from *md_dir* using LlamaIndex's SimpleDirectoryReader.
-    Each file becomes a LlamaIndex Document object; raw Markdown is preserved
-    so the downstream node parsers can exploit structural markers (##, ---, |…|).
 
-    Returns a list of Document objects sorted by filename for deterministic ordering.
+    Each file becomes a LlamaIndex Document; raw Markdown content is preserved
+    so that downstream parsers can exploit structural cues (##, ---, |…| tables).
+    Documents are sorted by filename for deterministic, reproducible ordering.
+
+    Raises SystemExit if the directory is missing or contains no .md files.
     """
     _banner("Step 1 — Loading Parsed Markdown Documents")
 
     if not md_dir.exists():
-        print(f"  [ERROR] Directory not found: {md_dir.resolve()}")
-        print("  Make sure Phase 1 (parsing) has been run before ingestion.")
-        sys.exit(1)
+        _fatal(
+            f"Directory not found: {md_dir.resolve()}\n"
+            "  Run Phase 1 (parsing) first to populate this directory."
+        )
 
     md_files = sorted(md_dir.glob("*.md"))
     if not md_files:
-        print(f"  [ERROR] No .md files found in: {md_dir.resolve()}")
-        sys.exit(1)
+        _fatal(
+            f"No .md files found in: {md_dir.resolve()}\n"
+            "  Place your parsed Markdown files there and retry."
+        )
 
-    print(f"  Found {len(md_files)} Markdown file(s) in '{md_dir}'\n")
+    _info(f"Found {len(md_files)} Markdown file(s) in '{md_dir}'")
+    print()
 
     reader = SimpleDirectoryReader(
         input_dir=str(md_dir),
         required_exts=[".md"],
-        recursive=False,            # flat directory — Phase 1 flattens output
-        filename_as_id=True,        # doc ID == file path for traceability
+        recursive=False,        # Phase 1 produces a flat directory
+        filename_as_id=True,    # doc.doc_id == file path for traceability
     )
 
-    documents = reader.load_data()
+    documents: list[Document] = reader.load_data()
 
-    # Log each loaded file
-    for i, doc in enumerate(documents, 1):
-        file_name = Path(doc.metadata.get("file_name", "unknown")).name
+    # Per-file log
+    for idx, doc in enumerate(documents, start=1):
+        fname      = Path(doc.metadata.get("file_name", "unknown")).name
         char_count = len(doc.text)
-        print(f"  [{i:>3}] {file_name:<55} ({char_count:,} chars)")
+        print(f"  [{idx:>3}] {fname:<52} {char_count:>10,} chars")
 
-    print(f"\n  ✓ Loaded {len(documents)} document(s) total.")
+    print()
+    _ok(f"Loaded {len(documents)} document(s).")
     return documents
 
 
@@ -114,65 +166,78 @@ def load_documents(md_dir: Path) -> list:
 # Step 2 — Academic Chunking Strategy
 # ─────────────────────────────────────────────────────────────────────────────
 
-def chunk_documents(documents: list) -> list[TextNode]:
+def chunk_documents(documents: list[Document]) -> list[BaseNode]:
     """
-    Two-pass academic chunking strategy:
+    Two-pass academic chunking strategy designed to preserve document structure.
 
     Pass 1 — MarkdownNodeParser
-        Splits on Markdown structural boundaries: section headers (# / ## / ###),
-        horizontal rules, and fence blocks.  This keeps each conceptual section
-        (Abstract, Methods, Results …) as its own node rather than cutting across
-        them arbitrarily.
+      Splits on Markdown structural boundaries: ATX headers (# / ## / ###),
+      horizontal rules (---), and fenced code/table blocks.  Each logical
+      section (Abstract, Introduction, Methods, Results, …) becomes its own
+      node, ensuring that semantically coherent content is never split in the
+      middle of a thought.
 
-    Pass 2 — SentenceSplitter fallback
-        Any node that survived Pass 1 and is still larger than CHUNK_SIZE tokens
-        is further split by the SentenceSplitter, which respects sentence boundaries
-        and adds CHUNK_OVERLAP to maintain cross-chunk context.
+    Pass 2 — SentenceSplitter (overflow guard)
+      Any node from Pass 1 that still exceeds CHUNK_SIZE tokens (rough
+      estimate: 1 token ≈ 4 characters) is further split respecting sentence
+      boundaries, with CHUNK_OVERLAP characters of context overlap to prevent
+      information loss at chunk boundaries.
 
-    Both passes propagate source metadata (file_name, page_label, section header)
-    so every node is traceable back to its origin.
+    Both passes propagate source metadata (file_name, page_label, header path)
+    so every chunk can be traced back to its origin document and section.
+
+    Returns a flat list of TextNode objects ready for embedding.
     """
     _banner("Step 2 — Academic Chunking Strategy")
 
-    # Pass 1: Markdown-structure-aware splitting
-    print("  Pass 1: MarkdownNodeParser (structure-aware split) …")
-    md_parser = MarkdownNodeParser()
-    md_nodes  = md_parser.get_nodes_from_documents(documents, show_progress=False)
-    print(f"          → {len(md_nodes)} nodes after Markdown structural split")
+    # ── Pass 1: Markdown structure-aware split ────────────────────────────────
+    _info("Pass 1: MarkdownNodeParser (split on headers / HR / tables) …")
+    md_parser  = MarkdownNodeParser()
+    md_nodes   = md_parser.get_nodes_from_documents(documents, show_progress=False)
+    _info(f"        → {len(md_nodes)} nodes after structural split")
 
-    # Pass 2: Safety-net sentence-level split for oversized nodes
-    print(f"  Pass 2: SentenceSplitter fallback (chunk={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}) …")
+    # ── Pass 2: Sentence-level overflow guard ─────────────────────────────────
+    _info(
+        f"Pass 2: SentenceSplitter fallback "
+        f"(chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}) …"
+    )
     sentence_splitter = SentenceSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         paragraph_separator="\n\n",
     )
 
-    final_nodes: list[TextNode] = []
-    oversized   = 0
+    final_nodes: list[BaseNode] = []
+    overflow_count = 0
 
     for node in md_nodes:
-        # A rough token estimate: 1 token ≈ 4 chars for English academic text
-        estimated_tokens = len(node.text) // 4
-        if estimated_tokens > CHUNK_SIZE:
+        # Rough token estimate: 4 chars ≈ 1 token for English academic prose
+        approx_tokens = len(node.text) // 4
+
+        if approx_tokens > CHUNK_SIZE:
+            # Treat this oversized node as a mini-document for the splitter
             sub_nodes = sentence_splitter.get_nodes_from_documents(
-                [node],  # treat this node as a mini-document
+                [node],
                 show_progress=False,
             )
             final_nodes.extend(sub_nodes)
-            oversized += 1
+            overflow_count += 1
         else:
             final_nodes.append(node)
 
-    print(f"          → {oversized} oversized node(s) further split")
-    print(f"\n  ✓ Final chunk count: {len(final_nodes)} nodes")
+    _info(f"        → {overflow_count} oversized node(s) split further")
 
-    # Summary statistics
+    # ── Statistics ────────────────────────────────────────────────────────────
+    print()
     lengths = [len(n.text) for n in final_nodes]
     if lengths:
-        avg_len = sum(lengths) / len(lengths)
-        print(f"     Avg node size : {avg_len:,.0f} chars")
-        print(f"     Min / Max     : {min(lengths):,} / {max(lengths):,} chars")
+        avg = sum(lengths) / len(lengths)
+        _ok(
+            f"Final chunk count: {len(final_nodes)} nodes  "
+            f"(avg {avg:,.0f} chars · min {min(lengths):,} · max {max(lengths):,})"
+        )
+    else:
+        _ok("Final chunk count: 0 nodes")
 
     return final_nodes
 
@@ -181,268 +246,315 @@ def chunk_documents(documents: list) -> list[TextNode]:
 # Step 3 — Vector Database Connection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def init_chroma(chroma_dir: Path, collection_name: str, reset: bool = False):
+def init_chroma(
+    chroma_dir:      Path,
+    collection_name: str,
+    reset:           bool = False,
+) -> tuple[chromadb.Collection, ChromaVectorStore]:
     """
     Initialise a *persistent* ChromaDB client stored at *chroma_dir*.
 
-    If *reset* is True the existing collection (if any) is deleted so that a
-    clean re-index can be performed.  Otherwise the existing collection is loaded
-    and new nodes are added incrementally (deduplication is handled by ChromaDB
-    via node IDs).
+    Persistence model
+    -----------------
+    ChromaDB's PersistentClient writes every mutation to disk immediately via
+    SQLite + HNSW on-disk files.  There is no explicit .persist() call needed —
+    data is safe as soon as the embedding call returns.
 
-    Returns (chroma_collection, ChromaVectorStore).
+    Reset flag
+    ----------
+    When *reset=True* the existing collection is deleted before re-creation,
+    enabling a clean full re-index without leaving stale vectors behind.
+    When *reset=False* the collection is opened in append mode; duplicate node
+    IDs are silently ignored by ChromaDB (upsert semantics).
+
+    Returns
+    -------
+    (chromadb.Collection, ChromaVectorStore)  — both wired to the same store.
     """
     _banner("Step 3 — ChromaDB Vector Store Initialisation")
 
     chroma_dir.mkdir(parents=True, exist_ok=True)
-    print(f"  Persistent path : {chroma_dir.resolve()}")
-    print(f"  Collection name : {collection_name}")
+    _info(f"Persistent path : {chroma_dir.resolve()}")
+    _info(f"Collection name : {collection_name}")
 
-    client = chromadb.PersistentClient(path=str(chroma_dir))
+    client = chromadb.PersistentClient(
+        path=str(chroma_dir),
+        settings=ChromaSettings(anonymized_telemetry=False),
+    )
 
     if reset:
         try:
             client.delete_collection(collection_name)
-            print(f"  ↻  Existing collection deleted (--reset flag).")
+            _info("Existing collection deleted (--reset flag active).")
         except Exception:
-            pass  # collection did not exist — that's fine
+            _info("No existing collection found to delete — starting fresh.")
 
     collection = client.get_or_create_collection(
         name=collection_name,
-        # ChromaDB cosine distance matches BGE / nomic embedding conventions
+        # Cosine distance is standard for normalised BGE / nomic embeddings
         metadata={"hnsw:space": "cosine"},
     )
 
-    existing_count = collection.count()
-    print(f"  Existing vectors in store : {existing_count:,}")
-
-    vector_store = ChromaVectorStore(chroma_collection=collection)
-    print("  ✓ ChromaDB ready.")
-    return collection, vector_store
+    existing = collection.count()
+    _info(f"Vectors already in store : {existing:,}")
+    _ok("ChromaDB ready.")
+    return collection, ChromaVectorStore(chroma_collection=collection)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 4 — Embedding Model Setup
+# Step 4 — Embedding Model Initialisation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def init_embedding_model(model_key: str = "bge") -> HuggingFaceEmbedding:
     """
-    Load a local embedding model.  Two presets are supported:
+    Load a fully local embedding model from the HuggingFace Hub.
 
-    "bge"   — BAAI/bge-small-en-v1.5   (default)
-               ~33 MB, fast CPU inference, strong on academic English.
+    Models are downloaded once and cached at ~/.cache/huggingface/hub/.
+    No API key or internet connection is needed after the initial download.
 
-    "nomic" — nomic-ai/nomic-embed-text-v1
-               ~274 MB, higher quality, requires more RAM.
+    Presets
+    -------
+    "bge"   — BAAI/bge-small-en-v1.5  (~33 MB)
+               Fast CPU inference, state-of-the-art on BEIR academic benchmarks.
+               Default choice for most workstations.
 
-    The model is cached in the default HuggingFace hub directory
-    (~/.cache/huggingface/hub) after the first download.
-    No API keys or external services are needed at runtime.
+    "nomic" — nomic-ai/nomic-embed-text-v1  (~274 MB)
+               Higher quality at the cost of ~8× more RAM and slower encoding.
+               Requires trust_remote_code=True.
+
+    The loaded model is injected into LlamaIndex's global Settings so every
+    component in the pipeline automatically uses it without further wiring.
+    The LLM is explicitly disabled because ingestion never needs text generation.
     """
     _banner("Step 4 — Embedding Model Initialisation")
 
-    presets = {
-        "bge":   {
-            "model_name": "BAAI/bge-small-en-v1.5",
-            "embed_batch_size": 32,
-            "query_instruction": "Represent this sentence for searching relevant passages: ",
-        },
-        "nomic": {
-            "model_name": "nomic-ai/nomic-embed-text-v1",
-            "embed_batch_size": 16,
-            "query_instruction": "search_query: ",
-            "trust_remote_code": True,
-        },
-    }
-
-    if model_key not in presets:
-        print(f"  [WARN] Unknown model key '{model_key}'. Falling back to 'bge'.")
+    if model_key not in EMBED_PRESETS:
+        _warn(f"Unknown model key '{model_key}'. Falling back to 'bge'.")
         model_key = "bge"
 
-    cfg = presets[model_key]
+    cfg        = EMBED_PRESETS[model_key]
     model_name = cfg["model_name"]
 
-    print(f"  Model : {model_name}")
-    print(f"  Batch : {cfg['embed_batch_size']} nodes per embedding call")
-    print("  Downloading / loading from local cache …")
+    _info(f"Model    : {model_name}")
+    _info(f"Profile  : {cfg['description']}")
+    _info(f"Batch    : {cfg['embed_batch_size']} nodes per embedding call")
+    _info("Loading model (first run downloads to HuggingFace cache) …")
 
-    start = time.perf_counter()
+    t_start = time.perf_counter()
 
-    # Build kwargs dynamically so we only pass trust_remote_code when needed
-    embed_kwargs = {
-        "model_name":       model_name,
-        "embed_batch_size": cfg["embed_batch_size"],
+    # Build kwargs; only include trust_remote_code when the preset requires it
+    kwargs: dict = {
+        "model_name":        model_name,
+        "embed_batch_size":  cfg["embed_batch_size"],
         "query_instruction": cfg.get("query_instruction", ""),
     }
     if cfg.get("trust_remote_code"):
-        embed_kwargs["trust_remote_code"] = True
+        kwargs["trust_remote_code"] = True
 
-    embed_model = HuggingFaceEmbedding(**embed_kwargs)
+    embed_model = HuggingFaceEmbedding(**kwargs)
 
-    elapsed = time.perf_counter() - start
-    print(f"  ✓ Model loaded in {elapsed:.1f}s")
+    elapsed = time.perf_counter() - t_start
+    _ok(f"Model loaded in {elapsed:.1f}s")
 
-    # Inject into LlamaIndex global settings so every downstream component uses it
+    # Wire into LlamaIndex globals
     Settings.embed_model = embed_model
-    # Disable the LLM globally — ingestion never needs a generative model
-    Settings.llm = None
+    Settings.llm         = None   # no LLM needed during ingestion
 
     return embed_model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 5 — Build Index & Persist to Chroma
+# Step 5 — Build Index & Persist to ChromaDB
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_and_persist_index(
-    nodes:        list[TextNode],
+    nodes:        list[BaseNode],
     vector_store: ChromaVectorStore,
 ) -> VectorStoreIndex:
     """
-    Generate embeddings for every node and persist them to ChromaDB.
+    Embed all nodes and persist the index to ChromaDB.
 
-    LlamaIndex's VectorStoreIndex handles batching, embedding calls, and writing
-    to the vector store automatically.  The StorageContext wires the index to our
-    persistent Chroma collection, so there is no separate "save" step — every
-    write goes straight to disk.
+    LlamaIndex's VectorStoreIndex handles:
+      • Batching embedding calls according to embed_batch_size
+      • Calling the embedding model for each batch
+      • Writing (id, embedding, metadata, text) tuples to ChromaDB via upsert
 
-    Returns the in-memory VectorStoreIndex (useful for an optional smoke-test query).
+    Because ChromaVectorStore is backed by a PersistentClient, every write is
+    flushed to disk immediately — there is no separate "save" or "commit" step.
+
+    The returned VectorStoreIndex object can be used directly for smoke-test
+    queries in Phase 3 without reloading from disk.
     """
     _banner("Step 5 — Embedding Generation & Index Persistence")
 
     storage_ctx = StorageContext.from_defaults(vector_store=vector_store)
 
-    print(f"  Embedding {len(nodes)} node(s) — this may take a few minutes on CPU …\n")
+    _info(f"Embedding {len(nodes)} node(s) — may take several minutes on CPU …")
+    print()
+
     t_start = time.perf_counter()
 
     index = VectorStoreIndex(
         nodes=nodes,
         storage_context=storage_ctx,
-        show_progress=True,   # LlamaIndex's own tqdm progress bar
+        show_progress=True,   # renders LlamaIndex's built-in tqdm progress bar
     )
 
     elapsed = time.perf_counter() - t_start
-    rate    = len(nodes) / elapsed if elapsed > 0 else 0
+    rate    = len(nodes) / elapsed if elapsed > 0 else 0.0
 
-    print(f"\n  ✓ Indexing complete in {elapsed:.1f}s  ({rate:.1f} nodes/s)")
+    print()  # newline after tqdm bar
+    _ok(f"Indexing complete in {elapsed:.1f}s  ({rate:.1f} nodes/s)")
     return index
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 6 — Final Report
+# Step 6 — Terminal Summary Report
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_final_report(
-    collection,
-    nodes:        list[TextNode],
-    chroma_dir:   Path,
+    collection:  chromadb.Collection,
+    nodes:       list[BaseNode],
+    chroma_dir:  Path,
+    model_key:   str,
 ) -> None:
-    """Print a summary table so the operator can confirm everything landed correctly."""
+    """
+    Print a formatted summary confirming what was indexed and where it lives.
+    Gives the operator a quick sanity-check before moving to Phase 3.
+    """
     _banner("Ingestion Complete — Summary Report")
 
     total_in_store = collection.count()
-
-    # Unique source files represented by the new nodes
-    source_files = {
+    source_files   = {
         Path(n.metadata.get("file_name", "unknown")).name
         for n in nodes
     }
 
-    print(f"  Source files processed : {len(source_files)}")
-    print(f"  Nodes generated        : {len(nodes)}")
-    print(f"  Total vectors in store : {total_in_store:,}")
-    print(f"  Persisted to           : {chroma_dir.resolve()}")
+    cfg = EMBED_PRESETS.get(model_key, EMBED_PRESETS["bge"])
+
+    rows = [
+        ("Source files processed", str(len(source_files))),
+        ("Nodes generated",        str(len(nodes))),
+        ("Total vectors in store", f"{total_in_store:,}"),
+        ("Embedding model",        cfg["model_name"]),
+        ("Persisted to",           str(chroma_dir.resolve())),
+    ]
+
+    col_w = max(len(r[0]) for r in rows) + 2
+    for label, value in rows:
+        print(f"  {label:<{col_w}}: {value}")
+
     print()
     print("  Source files:")
     for fname in sorted(source_files):
         print(f"    • {fname}")
 
     print()
-    print("  The index is ready for Phase 3 (retrieval / querying).")
-    print("=" * 70 + "\n")
+    _ok("Index is ready for Phase 3 (retrieval & querying).")
+    print(f"{'=' * WIDTH}\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI Entry Point
+# CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        prog="ingest.py",
         description="Phase 2: Chunk & index parsed academic Markdown into ChromaDB.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python ingest.py                   # Standard run with BGE embeddings
-  python ingest.py --reset           # Wipe existing collection and re-index
-  python ingest.py --model nomic     # Use nomic-embed-text instead of BGE
-  python ingest.py --md-dir ./custom/path --reset
-        """,
+        epilog=textwrap_dedent("""
+        Examples:
+          python ingest.py
+          python ingest.py --reset
+          python ingest.py --model nomic
+          python ingest.py --md-dir ./papers --chroma-dir ./db --reset
+        """),
     )
     parser.add_argument(
         "--md-dir",
         type=Path,
         default=PARSED_MD_DIR,
-        help=f"Directory containing parsed .md files (default: {PARSED_MD_DIR})",
+        metavar="PATH",
+        help=f"Directory with parsed .md files  (default: {PARSED_MD_DIR})",
     )
     parser.add_argument(
         "--chroma-dir",
         type=Path,
         default=CHROMA_DB_DIR,
-        help=f"ChromaDB persistence directory (default: {CHROMA_DB_DIR})",
+        metavar="PATH",
+        help=f"ChromaDB persistence directory   (default: {CHROMA_DB_DIR})",
     )
     parser.add_argument(
         "--collection",
         type=str,
         default=COLLECTION_NAME,
-        help=f"ChromaDB collection name (default: {COLLECTION_NAME})",
+        metavar="NAME",
+        help=f"ChromaDB collection name         (default: {COLLECTION_NAME})",
     )
     parser.add_argument(
         "--model",
         type=str,
         default="bge",
-        choices=["bge", "nomic"],
-        help="Embedding model preset: 'bge' (BAAI/bge-small-en-v1.5) or 'nomic' (nomic-embed-text-v1)",
+        choices=list(EMBED_PRESETS.keys()),
+        help="Embedding model preset  (default: bge)",
     )
     parser.add_argument(
         "--reset",
         action="store_true",
         default=False,
-        help="Delete the existing ChromaDB collection before indexing (full re-index)",
+        help="Delete the existing collection before indexing (full re-index)",
     )
     return parser.parse_args()
 
 
+# textwrap.dedent alias so the import stays at the top even if we add it later
+def textwrap_dedent(s: str) -> str:
+    import textwrap
+    return textwrap.dedent(s)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main() -> None:
     args = parse_args()
 
-    print("\n" + "=" * 70)
-    print("  RAG System - Phase 2: Chunking & Indexing Engine")
-    print("=" * 70)
+    print(f"\n{'=' * WIDTH}")
+    print("  RAG System — Phase 2: Chunking & Indexing Engine")
+    print(f"{'=' * WIDTH}")
+    _info(f"Markdown dir  : {args.md_dir.resolve()}")
+    _info(f"ChromaDB dir  : {args.chroma_dir.resolve()}")
+    _info(f"Collection    : {args.collection}")
+    _info(f"Embed model   : {EMBED_PRESETS[args.model]['model_name']}")
+    _info(f"Reset mode    : {'YES — existing data will be wiped' if args.reset else 'NO  — incremental append'}")
 
-    # ── Step 1: Load ──────────────────────────────────────────────────────────
+    # ── 1. Load ───────────────────────────────────────────────────────────────
     documents = load_documents(args.md_dir)
 
-    # ── Step 2: Chunk ─────────────────────────────────────────────────────────
+    # ── 2. Chunk ──────────────────────────────────────────────────────────────
     nodes = chunk_documents(documents)
 
-    # ── Step 3: Vector DB ─────────────────────────────────────────────────────
+    # ── 3. Vector DB ──────────────────────────────────────────────────────────
     collection, vector_store = init_chroma(
         chroma_dir=args.chroma_dir,
         collection_name=args.collection,
         reset=args.reset,
     )
 
-    # ── Step 4: Embedding model ───────────────────────────────────────────────
+    # ── 4. Embedding model ────────────────────────────────────────────────────
     init_embedding_model(model_key=args.model)
 
-    # ── Step 5: Build & persist ───────────────────────────────────────────────
+    # ── 5. Build & persist ────────────────────────────────────────────────────
     build_and_persist_index(nodes=nodes, vector_store=vector_store)
 
-    # ── Step 6: Final report ──────────────────────────────────────────────────
+    # ── 6. Report ─────────────────────────────────────────────────────────────
     print_final_report(
         collection=collection,
         nodes=nodes,
         chroma_dir=args.chroma_dir,
+        model_key=args.model,
     )
 
 
